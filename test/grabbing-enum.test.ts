@@ -10,9 +10,7 @@ test("Basic", () => {
   console.log(libclang.clang_createTranslationUnitFromSourceFile);
   const tu = libclang.clang_createTranslationUnitFromSourceFile!(
     idx,
-    Buffer.from(
-      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/AppKit.framework/Versions/C/Headers/NSWindow.h\0",
-    ),
+    "./test/hello.c",
     0,
     null,
     0,
@@ -20,10 +18,21 @@ test("Basic", () => {
   );
   console.log("Translation Unit:", tu);
   const cursor = libclang.clang_getTranslationUnitCursor!(tu);
+  console.log("Cursor:", cursor);
   const kind = libclang.clang_getCursorKind!(cursor);
+  console.log("Cursor kind:", kind);
+  const kinds: number[] = [];
   const visitor = makeCXCursorVisitor((cursor, parent, clientData) => {
-    console.log("Cursor kind:", libclang!.clang_getCursorKind!(cursor));
+    console.log("Visiting cursor", cursor);
+    console.log(
+      "Cursor:",
+      libclang!.clang_getCString!(libclang!.clang_getCursorSpelling!(cursor)),
+      "kind:",
+      libclang!.clang_getCursorKind!(cursor),
+    );
+    kinds.push(libclang!.clang_getCursorKind!(cursor));
     return CXChildVisit_Recurse;
   });
   libclang.clang_visitChildren!(cursor, visitor, null);
+  console.log("Visited cursor kinds:", kinds);
 });

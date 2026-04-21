@@ -27,11 +27,33 @@ import {
   CXTypeToArrayBuffer,
   CXTokenFromArrayBuffer,
   CXTokenToArrayBuffer,
+  nodeApiCall,
 } from "./bindings";
 
 /// Visitor
 
 var visitorCount = 0;
+
+function cstringToJSString(
+  argName: string,
+  resultName: string,
+  earlyRet: string,
+) {
+  return `napi_value ${resultName};
+  ${nodeApiCall(earlyRet, `napi_create_string_utf8(env, ${argName}, NAPI_AUTO_LENGTH, &${resultName})`)}`;
+}
+
+function cstringFromJSString(
+  argName: string,
+  resultName: string,
+  earlyRet: string,
+) {
+  // Don't forget to free the result after use!!
+  return `size_t ${resultName}_len;
+  ${nodeApiCall(earlyRet, `napi_get_value_string_utf8(env, ${argName}, NULL, 0, &${resultName}_len)`)}
+  char *${resultName} = (char *)malloc(${resultName}_len + 1);
+  ${nodeApiCall(earlyRet, `napi_get_value_string_utf8(env, ${argName}, ${resultName}, ${resultName}_len + 1, NULL)`)}`;
+}
 
 export function makeCXCursorVisitor(
   callback: (
@@ -50,7 +72,7 @@ export function makeCXCursorVisitor(
     const parentBuf = toArrayBuffer(parentAddr, 0, 32); // note me when human progress to 128-bit computer (
     return callback(cursorBuf, parentBuf, clientData);
   };
-  const cb = new JSCallback(callback, {
+  const cb = new JSCallback(wrappedCb, {
     args: [FFIType.pointer, FFIType.pointer, FFIType.pointer],
     returns: FFIType.i32,
   });
@@ -161,7 +183,7 @@ function genWrapperCode(name: string, func: ClangFFIFunctionLike): WrapperCode {
   const calleeDef = `${calleeRetType} ${name}(${func.args.map(sig).join(", ")});`;
   const callArgs: string[] = [];
 
-  let postCallForm = "";
+  const postCallForms: string[] = [];
   let retVar: string;
   let retType: FFITypeOrString;
   let earlyRet: string;
@@ -172,38 +194,50 @@ function genWrapperCode(name: string, func: ClangFFIFunctionLike): WrapperCode {
   switch (func.returns) {
     case ClangType.CXString:
       earlyRet = "NULL";
-      postCallForm = CXStringToArrayBuffer("result", "result_buf", earlyRet);
+      postCallForms.push(
+        CXStringToArrayBuffer("result", "result_buf", earlyRet),
+      );
       retVar = "result_buf";
       retType = "napi_value";
       jsRet = FFIType.napi_value;
       break;
     case ClangType.CXCursor:
       earlyRet = "NULL";
-      postCallForm = CXCursorToArrayBuffer("result", "result_buf", earlyRet);
+      postCallForms.push(
+        CXCursorToArrayBuffer("result", "result_buf", earlyRet),
+      );
       retVar = "result_buf";
       retType = "napi_value";
       jsRet = FFIType.napi_value;
       break;
     case ClangType.CXType:
       earlyRet = "NULL";
-      postCallForm = CXTypeToArrayBuffer("result", "result_buf", earlyRet);
+      postCallForms.push(CXTypeToArrayBuffer("result", "result_buf", earlyRet));
       retVar = "result_buf";
       retType = "napi_value";
       jsRet = FFIType.napi_value;
       break;
     case ClangType.CXToken:
       earlyRet = "NULL";
-      postCallForm = CXTokenToArrayBuffer("result", "result_buf", earlyRet);
+      postCallForms.push(
+        CXTokenToArrayBuffer("result", "result_buf", earlyRet),
+      );
       retVar = "result_buf";
       retType = "napi_value";
       jsRet = FFIType.napi_value;
       break;
     case FFIType.void:
       earlyRet = "";
-      postCallForm = "";
       retVar = "";
       retType = "void";
       jsRet = FFIType.void;
+      break;
+    case FFIType.cstring:
+      earlyRet = "NULL";
+      postCallForms.push(cstringToJSString("result", "result_str", earlyRet));
+      retVar = "result_str";
+      retType = "napi_value";
+      jsRet = FFIType.napi_value;
       break;
     default:
       earlyRet = "0";
@@ -246,6 +280,15 @@ function genWrapperCode(name: string, func: ClangFFIFunctionLike): WrapperCode {
         callArgs.push(`arg${i}_buf`);
         jsArgs.push(FFIType.napi_value);
         break;
+      case FFIType.cstring:
+        defArgs.push(`napi_value arg${i}`);
+        preCallForms.push(
+          cstringFromJSString(`arg${i}`, `arg${i}_cstr`, earlyRet),
+        );
+        postCallForms.push(`free(arg${i}_cstr);`);
+        callArgs.push(`arg${i}_cstr`);
+        jsArgs.push(FFIType.napi_value);
+        break;
       default:
         defArgs.push(`${sig(arg)} arg${i}`);
         callArgs.push(`arg${i}`);
@@ -264,7 +307,7 @@ function genWrapperCode(name: string, func: ClangFFIFunctionLike): WrapperCode {
 ${retType} ${wrappedName}(${defArgs.join(", ")}) {
   ${preCallForms.join("\n  ")}
   ${call}
-  ${postCallForm}
+  ${postCallForms.join("\n  ")}
   return ${retVar};
 }`,
     fns: {
@@ -325,12 +368,14 @@ export function load(libclangPath?: string) {
     Object.assign(fnss, fns);
   });
   const code = `#include <node/node_api.h>
+#include <stdlib.h>
+#include <string.h>
 
-  ${Array.from(typedefss).join("\n")}
+${Array.from(typedefss).join("\n")}
 
-  ${fdefs.join("\n")}
+${fdefs.join("\n")}
 
-  ${codes.join("\n")}
+${codes.join("\n")}
 `;
   const source = Bun.file(os.tmpdir() + `/__bun_libclang_wrapper.c`);
   Bun.write(source, code);

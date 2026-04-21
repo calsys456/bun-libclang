@@ -1006,7 +1006,7 @@ export enum ClangType {
 }
 
 // copied from https://nodejs.org/api/n-api.html
-const nodeApiCall = (earlyRet: string, call: string) => `do {
+export const nodeApiCall = (earlyRet: string, call: string) => `do {
     napi_status status = ${call};
     if (status != napi_ok) {
         const napi_extended_error_info* error_info = NULL;
@@ -1025,9 +1025,11 @@ const nodeApiCall = (earlyRet: string, call: string) => `do {
   } while(0);`;
 
 function structToArrayBuffer(ctype: string) {
-  return (argName: string, resultName: string, earlyRet: string) => `
+  return (argName: string, resultName: string, earlyRet: string) =>
+    `void *${argName}_data;
   napi_value ${resultName};
-  ${nodeApiCall(earlyRet, `napi_create_arraybuffer(env, sizeof(${ctype}), (void**)&${argName}, &${resultName})`)}`;
+  ${nodeApiCall(earlyRet, `napi_create_arraybuffer(env, sizeof(${ctype}), &${argName}_data, &${resultName})`)}
+  memcpy(${argName}_data, &${argName}, sizeof(${ctype}));`;
 }
 
 function structFromArrayBuffer(ctype: string) {
