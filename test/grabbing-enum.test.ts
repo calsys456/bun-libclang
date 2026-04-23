@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { load, libclang, assertLibclang, makeCXCursorVisitor } from "../index";
-import { CXChildVisit_Recurse } from "../bindings";
+import { CXChildVisitResult } from "../bindings";
 
 test("Basic", () => {
   load();
@@ -31,7 +31,7 @@ test("Basic", () => {
       libclang!.clang_getCursorKind!(cursor),
     );
     kinds.push(libclang!.clang_getCursorKind!(cursor));
-    return CXChildVisit_Recurse;
+    return CXChildVisitResult.recurse;
   });
   libclang.clang_visitChildren!(cursor, visitor, null);
   console.log("Visited cursor kinds:", kinds);

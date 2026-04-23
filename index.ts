@@ -11,7 +11,6 @@ import {
   toBuffer,
   ptr,
   type FFITypeToArgsType,
-  type FFITypeStringToType,
   type FFITypeToReturnsType,
   type ToFFIType,
 } from "bun:ffi";
@@ -24,33 +23,44 @@ import {
   structFromArrayBuffer,
   ClangTypedefs,
   ClangTypeSizes,
-  CXLoadDiag_None,
-  type libclangByValueStruct,
+  type ClangByValueStruct,
+  CXLoadDiag_Error,
+  CXChildVisitResult,
+  type ClangEnum,
+  type ClangTypeToEnumType,
 } from "./bindings";
 
 /// Types
 
 type libclangFunction = keyof typeof libclangBindings;
 
-function isByValueStruct(type: unknown): type is libclangByValueStruct {
+function isClangByValueStruct(type: unknown): type is ClangByValueStruct {
   return typeof type === "string" && type.startsWith("CX");
 }
 
-type libclangArg<U> = U extends libclangByValueStruct
-  ? ArrayBuffer
-  : U extends FFIType.cstring | "cstring"
-    ? string
-    : U extends FFITypeOrString
-      ? FFITypeToArgsType[ToFFIType<U>]
-      : never;
+function isClangEnum(type: unknown): type is ClangEnum {
+  return typeof type === "string" && type.startsWith("enum");
+}
 
-type libclangRet<U> = U extends libclangByValueStruct
+type libclangArg<U> = U extends ClangByValueStruct
   ? ArrayBuffer
-  : U extends FFIType.cstring | "cstring"
-    ? string
-    : U extends FFITypeOrString
-      ? FFITypeToReturnsType[ToFFIType<U>]
-      : never;
+  : U extends ClangEnum
+    ? ClangTypeToEnumType[U]
+    : U extends FFIType.cstring | "cstring"
+      ? string
+      : U extends FFITypeOrString
+        ? FFITypeToArgsType[ToFFIType<U>]
+        : never;
+
+type libclangRet<U> = U extends ClangByValueStruct
+  ? ArrayBuffer
+  : U extends ClangEnum
+    ? ClangTypeToEnumType[U]
+    : U extends FFIType.cstring | "cstring"
+      ? string
+      : U extends FFITypeOrString
+        ? FFITypeToReturnsType[ToFFIType<U>]
+        : never;
 
 type libclangArgs<T> = {
   [K in keyof T]: libclangArg<T[K]>;
@@ -94,7 +104,7 @@ export function makeCXCursorVisitor(
     cursor: ArrayBuffer,
     parent: ArrayBuffer,
     clientData: FFIType.pointer,
-  ) => number,
+  ) => CXChildVisitResult,
 ): Pointer {
   const id = visitorCount++;
   const wrappedCb = (
@@ -143,13 +153,24 @@ interface WrapperCode {
   fns: Record<string, FFIFunction>;
 }
 
-function genWrapperCode(
-  name: string,
-  func: (typeof libclangBindings)[keyof typeof libclangBindings],
-): WrapperCode {
+type libclangBindingEntry = {
+  [K in keyof typeof libclangBindings]: [K, (typeof libclangBindings)[K]];
+}[keyof typeof libclangBindings];
+
+/**
+ * Generate wrapper codes for `libclangBindings`, mostly handling by-value
+ * structs and cstring conversion.
+ * 
+ * JIT compile the wrapper code, to get what we want for JS side.
+ * 
+ * @param binding One key-value pair from `libclangBindings`
+ * @returns wrapper codes
+ */
+function genWrapperCode(binding: libclangBindingEntry): WrapperCode {
+  const [name, func] = binding;
   const typedefs: Set<string> = new Set();
   const sig = (type: ClangType | FFITypeOrString): string => {
-    if (isByValueStruct(type)) {
+    if (isClangByValueStruct(type)) {
       typedefs.add(ClangTypedefs[type]);
       return type;
     } else {
@@ -221,7 +242,7 @@ function genWrapperCode(
   const jsArgs: FFITypeOrString[] = [];
   let jsRet: FFITypeOrString;
 
-  if (isByValueStruct(func.returns)) {
+  if (isClangByValueStruct(func.returns)) {
     earlyRet = "NULL";
     postCallForms.push(
       structToArrayBuffer(func.returns, "result", "result_buf", earlyRet),
@@ -229,6 +250,11 @@ function genWrapperCode(
     retVar = "result_buf";
     retType = "napi_value";
     jsRet = FFIType.napi_value;
+  } else if (isClangEnum(func.returns)) {
+    earlyRet = "0";
+    retVar = "result";
+    retType = "int";
+    jsRet = FFIType.i32;
   } else if (func.returns === FFIType.void) {
     earlyRet = "";
     retVar = "";
@@ -247,13 +273,17 @@ function genWrapperCode(
     jsRet = func.returns as FFITypeOrString;
   }
   func.args.forEach((arg, i) => {
-    if (isByValueStruct(arg)) {
+    if (isClangByValueStruct(arg)) {
       defArgs.push(`napi_value arg${i}`);
       preCallForms.push(
         structFromArrayBuffer(arg, `arg${i}`, `arg${i}_buf`, earlyRet),
       );
       callArgs.push(`arg${i}_buf`);
       jsArgs.push(FFIType.napi_value);
+    } else if (isClangEnum(arg)) {
+      defArgs.push(`int arg${i}`);
+      callArgs.push(`arg${i}`);
+      jsArgs.push(FFIType.i32);
     } else if (arg === FFIType.cstring) {
       defArgs.push(`napi_value arg${i}`);
       preCallForms.push(
@@ -291,6 +321,12 @@ ${retType} ${wrappedName}(${defArgs.join(", ")}) {
   };
 }
 
+// What, you asked me why put it into top-level forms?
+// Do JavaScript support dumpping image??...
+
+/**
+ * Default path to libclang.
+ */
 export const defaultLibclangPath = (await Bun.file(
   `libclang.${suffix}`,
 ).exists()) // try local
@@ -299,8 +335,12 @@ export const defaultLibclangPath = (await Bun.file(
     ? (await Bun.file("/opt/homebrew/opt/llvm/lib/libclang.dylib").exists())
       ? "/opt/homebrew/opt/llvm/lib/libclang.dylib" // try homebrew
       : `libclang.${suffix}` // praise the DYLD_LIBRARY_PATH
-    : `libclang.${suffix}`;
+    : `libclang.${suffix}`; // your DYLD_LIBRARY_PATH should work, praise it :D
 
+/**
+ * Loads libclang. `libclang` will be available after called.
+ * @param libclangPath Path to libclang library (defaults to system libclang)
+ */
 export function load(libclangPath: string = defaultLibclangPath) {
   // why we need the `library` option of `cc` to link libclang with TinyCC
   // when we can use symbols directly from RTLD_GLOBAL ? ¯\_(ツ)_/¯
@@ -330,13 +370,15 @@ export function load(libclangPath: string = defaultLibclangPath) {
   const fdefs: string[] = [];
   const codes: string[] = [];
   const fnss: Record<string, FFIFunction> = {};
-  Object.entries(libclangBindings).forEach(([name, func]) => {
-    const { typedefs, fdef, code, fns } = genWrapperCode(name, func);
-    typedefs.forEach((td) => typedefss.add(td));
-    fdefs.push(fdef);
-    codes.push(code);
-    Object.assign(fnss, fns);
-  });
+  (Object.entries(libclangBindings) as libclangBindingEntry[]).forEach(
+    (binding) => {
+      const { typedefs, fdef, code, fns } = genWrapperCode(binding);
+      typedefs.forEach((td) => typedefss.add(td));
+      fdefs.push(fdef);
+      codes.push(code);
+      Object.assign(fnss, fns);
+    },
+  );
   const code = `#include <node/node_api.h>
 #include <stdlib.h>
 #include <string.h>
@@ -371,7 +413,5 @@ export function assertLibclang(lib: any): asserts lib is libclangLib {
   }
 }
 
-export function unload() {
-  // again, nobody dlclose ;P
-  libclang = undefined;
-}
+// You don't need it ;P
+// export function unload() {}
