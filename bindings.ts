@@ -1,4 +1,4 @@
-import { FFIType, JSCallback } from "bun:ffi";
+import { FFIType, JSCallback, type FFITypeOrString } from "bun:ffi";
 
 /// Enums
 
@@ -968,11 +968,11 @@ export enum ClangType {
 
   // CXFile.h
   CXFile = "ptr",
-  CXFileUniqueID = cstructPtr,
+  CXFileUniqueID = "CXFileUniqueID", // by-value
 
   // CXSourceLocation.h
-  CXSourceLocation = cstructPtr,
-  CXSourceRange = cstructPtr,
+  CXSourceLocation = "CXSourceLocation", // by-value
+  CXSourceRange = "CXSourceRange", // by-value
   CXSourceRangeList = cstructPtr,
 
   // CXDiagnostic.h
@@ -984,11 +984,9 @@ export enum ClangType {
   CXTargetInfo = "ptr",
   CXTranslationUnit = "ptr",
   CXClientData = "ptr",
-  CXUnsavedFile = cstructPtr,
-  CXVersion = cstructPtr,
+  CXUnsavedFile = "CXUnsavedFile", // by-value
   CXIndexOptions = cstructPtr,
-  CXTUResourceUsageEntry = cstructPtr,
-  CXTUResourceUsage = cstructPtr,
+  CXTUResourceUsage = "CXTUResourceUsage", // by-value
   CXCursor = "CXCursor", // CXCursor is used by-value
   CXPlatformAvailability = cstructPtr,
   CXCursorSet = "ptr",
@@ -1000,10 +998,88 @@ export enum ClangType {
   CXCompletionResult = cstructPtr,
   CXCodeCompleteResults = cstructPtr,
   CXEvalResult = "ptr",
-  CXCursorAndRangeVisitor = cstructPtr,
-  CXIdxLoc = cstructPtr,
+  CXCursorAndRangeVisitor = "CXCursorAndRangeVisitor", // by-value
+  CXIdxLoc = "CXIdxLoc", // by-value
   CXIndexAction = "ptr",
 }
+
+export type libclangByValueStruct = Exclude<
+  (typeof ClangType)[keyof typeof ClangType],
+  FFITypeOrString
+>;
+
+export const ClangTypedefs: Record<libclangByValueStruct, string> = {
+  CXString: `typedef struct {
+  const void *data;
+  unsigned private_flags;
+} CXString;`,
+  CXFileUniqueID: `typedef struct {
+  unsigned long long data[3];
+} CXFileUniqueID;`,
+  CXSourceLocation: `typedef struct {
+  const void *ptr_data[2];
+  unsigned int_data;
+} CXSourceLocation;`,
+  CXSourceRange: `typedef struct {
+  const void *ptr_data[2];
+  unsigned begin_int_data;
+  unsigned end_int_data;
+} CXSourceRange;`,
+  CXUnsavedFile: `struct CXUnsavedFile {
+  const char *Filename;
+  const char *Contents;
+  unsigned long Length;
+};`,
+  CXTUResourceUsage: `typedef struct CXTUResourceUsageEntry {
+  enum CXTUResourceUsageKind kind;
+  unsigned long amount;
+} CXTUResourceUsageEntry;
+
+typedef struct CXTUResourceUsage {
+  void *data;
+  unsigned numEntries;
+  CXTUResourceUsageEntry *entries;
+} CXTUResourceUsage;`,
+  CXCursor: `typedef struct {
+  int kind;
+  int xdata;
+  const void *data[3];
+} CXCursor;`,
+  CXType: `typedef struct {
+  int kind;
+  void *data[2];
+} CXType;`,
+  CXToken: `typedef struct {
+  unsigned int_data[4];
+  void *ptr_data;
+} CXToken;`,
+  CXCursorAndRangeVisitor: `typedef struct CXCursorAndRangeVisitor {
+  void *context;
+  enum CXVisitorResult (*visit)(void *context, CXCursor, CXSourceRange);
+} CXCursorAndRangeVisitor;`,
+  CXIdxLoc: `typedef struct {
+  void *ptr_data[2];
+  unsigned int_data;
+} CXIdxLoc;`,
+} as const;
+
+/**
+ * 64-bit only
+ */
+export const ClangTypeSizes: Record<ClangType, number> = {
+  ptr: 8,
+  CXString: 16,
+  CXFileUniqueID: 24,
+  CXSourceLocation: 24,
+  CXSourceRange: 32,
+  CXUnsavedFile: 24,
+  CXTUResourceUsage: 24,
+  CXCursor: 32,
+  CXType: 24,
+  CXToken: 24,
+  CXCursorAndRangeVisitor: 16,
+  CXIdxLoc: 24,
+} as const;
 
 // copied from https://nodejs.org/api/n-api.html
 export const nodeApiCall = (earlyRet: string, call: string) => `do {
@@ -1024,17 +1100,25 @@ export const nodeApiCall = (earlyRet: string, call: string) => `do {
     }
   } while(0);`;
 
-function structToArrayBuffer(ctype: string) {
-  return (argName: string, resultName: string, earlyRet: string) =>
-    `void *${argName}_data;
+export function structToArrayBuffer(
+  ctype: string,
+  argName: string,
+  resultName: string,
+  earlyRet: string,
+) {
+  return `void *${argName}_data;
   napi_value ${resultName};
   ${nodeApiCall(earlyRet, `napi_create_arraybuffer(env, sizeof(${ctype}), &${argName}_data, &${resultName})`)}
   memcpy(${argName}_data, &${argName}, sizeof(${ctype}));`;
 }
 
-function structFromArrayBuffer(ctype: string) {
-  return (argName: string, resultName: string, earlyRet: string) =>
-    `${ctype} *${resultName}_ptr;
+export function structFromArrayBuffer(
+  ctype: string,
+  argName: string,
+  resultName: string,
+  earlyRet: string,
+) {
+  return `${ctype} *${resultName}_ptr;
   size_t ${resultName}_size;
   ${nodeApiCall(earlyRet, `napi_get_arraybuffer_info(env, ${argName}, (void**)&${resultName}_ptr, &${resultName}_size)`)}
   if (${resultName}_size != sizeof(${ctype})) {
@@ -1044,55 +1128,9 @@ function structFromArrayBuffer(ctype: string) {
   ${ctype} ${resultName} = *${resultName}_ptr;`;
 }
 
-export const CXStringTypedef = `
-typedef struct {
-  const void *data;
-  unsigned private_flags;
-} CXString;`;
-
-export const CXStringToArrayBuffer = structToArrayBuffer("CXString");
-
-export const CXStringFromArrayBuffer = structFromArrayBuffer("CXString");
-
-export const CXCursorTypedef = `
-typedef struct {
-  int kind;
-  int xdata;
-  const void *data[3];
-} CXCursor;`;
-
-export const CXCursorToArrayBuffer = structToArrayBuffer("CXCursor");
-
-export const CXCursorFromArrayBuffer = structFromArrayBuffer("CXCursor");
-
-export const CXTypeTypedef = `
-typedef struct {
-  int kind;
-  void *data[2];
-} CXType;`;
-
-export const CXTypeToArrayBuffer = structToArrayBuffer("CXType");
-
-export const CXTypeFromArrayBuffer = structFromArrayBuffer("CXType");
-
-export const CXTokenTypedef = `
-typedef struct {
-  unsigned int_data[4];
-  void *ptr_data;
-} CXToken;`;
-
-export const CXTokenToArrayBuffer = structToArrayBuffer("CXToken");
-
-export const CXTokenFromArrayBuffer = structFromArrayBuffer("CXToken");
-
 /// Functions
 
-export interface ClangFFIFunctionLike {
-  args: (ClangType | FFIType)[];
-  returns: ClangType | FFIType;
-}
-
-export const libclangBindings: Record<string, ClangFFIFunctionLike> = {
+export const libclangBindings = {
   // CXString.h
   clang_getCString: {
     args: [ClangType.CXString],
@@ -1305,7 +1343,7 @@ export const libclangBindings: Record<string, ClangFFIFunctionLike> = {
   // Index.h
   clang_createIndex: {
     args: [FFIType.bool, FFIType.bool],
-    returns: FFIType.pointer,
+    returns: ClangType.CXIndex,
   },
   clang_disposeIndex: {
     args: [ClangType.CXIndex],
@@ -1313,7 +1351,7 @@ export const libclangBindings: Record<string, ClangFFIFunctionLike> = {
   },
   clang_createIndexWithOptions: {
     args: [ClangType.CXIndexOptions],
-    returns: FFIType.pointer,
+    returns: ClangType.CXIndex,
   },
   clang_CXIndex_setGlobalOptions: {
     args: [ClangType.CXIndex, FFIType.u32],
@@ -1405,7 +1443,7 @@ export const libclangBindings: Record<string, ClangFFIFunctionLike> = {
       FFIType.cstring,
       FFIType.pointer,
       FFIType.i32,
-      ClangType.CXUnsavedFile,
+      FFIType.ptr,
       FFIType.u32,
       FFIType.u32,
     ],
@@ -1417,7 +1455,7 @@ export const libclangBindings: Record<string, ClangFFIFunctionLike> = {
       FFIType.cstring,
       FFIType.pointer,
       FFIType.i32,
-      ClangType.CXUnsavedFile,
+      FFIType.ptr,
       FFIType.u32,
       FFIType.u32,
       FFIType.pointer,
@@ -1430,7 +1468,7 @@ export const libclangBindings: Record<string, ClangFFIFunctionLike> = {
       FFIType.cstring,
       FFIType.pointer,
       FFIType.i32,
-      ClangType.CXUnsavedFile,
+      FFIType.ptr,
       FFIType.i32,
       FFIType.u32,
       FFIType.u32,
@@ -1459,12 +1497,7 @@ export const libclangBindings: Record<string, ClangFFIFunctionLike> = {
     returns: FFIType.u32,
   },
   clang_reparseTranslationUnit: {
-    args: [
-      ClangType.CXTranslationUnit,
-      FFIType.u32,
-      ClangType.CXUnsavedFile,
-      FFIType.u32,
-    ],
+    args: [ClangType.CXTranslationUnit, FFIType.u32, FFIType.ptr, FFIType.u32],
     returns: FFIType.i32,
   },
   clang_getTUResourceUsageName: {
@@ -2681,4 +2714,4 @@ export const libclangBindings: Record<string, ClangFFIFunctionLike> = {
     args: [ClangType.CXCursor],
     returns: FFIType.i32,
   },
-};
+} as const;

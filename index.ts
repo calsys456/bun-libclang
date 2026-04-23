@@ -2,33 +2,67 @@ import {
   FFIType,
   type FFIFunction,
   dlopen,
-  viewSource,
   type FFITypeOrString,
   cc,
   suffix,
   JSCallback,
   toArrayBuffer,
   type Pointer,
+  toBuffer,
+  ptr,
+  type FFITypeToArgsType,
+  type FFITypeStringToType,
+  type FFITypeToReturnsType,
+  type ToFFIType,
 } from "bun:ffi";
 import os from "os";
 import {
   libclangBindings,
   ClangType,
-  type ClangFFIFunctionLike,
-  CXCursorTypedef,
-  CXTypeTypedef,
-  CXStringTypedef,
-  CXTokenTypedef,
-  CXStringToArrayBuffer,
-  CXStringFromArrayBuffer,
-  CXCursorFromArrayBuffer,
-  CXCursorToArrayBuffer,
-  CXTypeFromArrayBuffer,
-  CXTypeToArrayBuffer,
-  CXTokenFromArrayBuffer,
-  CXTokenToArrayBuffer,
   nodeApiCall,
+  structToArrayBuffer,
+  structFromArrayBuffer,
+  ClangTypedefs,
+  ClangTypeSizes,
+  CXLoadDiag_None,
+  type libclangByValueStruct,
 } from "./bindings";
+
+/// Types
+
+type libclangFunction = keyof typeof libclangBindings;
+
+function isByValueStruct(type: unknown): type is libclangByValueStruct {
+  return typeof type === "string" && type.startsWith("CX");
+}
+
+type libclangArg<U> = U extends libclangByValueStruct
+  ? ArrayBuffer
+  : U extends FFIType.cstring | "cstring"
+    ? string
+    : U extends FFITypeOrString
+      ? FFITypeToArgsType[ToFFIType<U>]
+      : never;
+
+type libclangRet<U> = U extends libclangByValueStruct
+  ? ArrayBuffer
+  : U extends FFIType.cstring | "cstring"
+    ? string
+    : U extends FFITypeOrString
+      ? FFITypeToReturnsType[ToFFIType<U>]
+      : never;
+
+type libclangArgs<T> = {
+  [K in keyof T]: libclangArg<T[K]>;
+};
+
+type libclangLib = {
+  [P in libclangFunction]: (
+    ...args: libclangArgs<(typeof libclangBindings)[P]["args"]>
+  ) => libclangRet<(typeof libclangBindings)[P]["returns"]>;
+};
+
+export var libclang: libclangLib | undefined;
 
 /// Visitor
 
@@ -68,8 +102,8 @@ export function makeCXCursorVisitor(
     parentAddr: Pointer,
     clientData: Pointer,
   ) => {
-    const cursorBuf = toArrayBuffer(cursorAddr, 0, 32); // sizeof(CXCursor) == 32 (64-bit)
-    const parentBuf = toArrayBuffer(parentAddr, 0, 32); // note me when human progress to 128-bit computer (
+    const cursorBuf = toArrayBuffer(cursorAddr, 0, ClangTypeSizes.CXCursor);
+    const parentBuf = toArrayBuffer(parentAddr, 0, ClangTypeSizes.CXCursor);
     return callback(cursorBuf, parentBuf, clientData);
   };
   const cb = new JSCallback(wrappedCb, {
@@ -78,7 +112,7 @@ export function makeCXCursorVisitor(
   });
   const code = `#include <node/node_api.h>
 
-${CXCursorTypedef}
+${ClangTypedefs[ClangType.CXCursor]}
 
 int __visitor_${id}(CXCursor cursor, CXCursor parent, void* client_data) {
   return ((int (*)(CXCursor *, CXCursor *, void *))${cb.ptr})(&cursor, &parent, client_data);
@@ -109,69 +143,65 @@ interface WrapperCode {
   fns: Record<string, FFIFunction>;
 }
 
-function genWrapperCode(name: string, func: ClangFFIFunctionLike): WrapperCode {
+function genWrapperCode(
+  name: string,
+  func: (typeof libclangBindings)[keyof typeof libclangBindings],
+): WrapperCode {
   const typedefs: Set<string> = new Set();
   const sig = (type: ClangType | FFITypeOrString): string => {
-    switch (type) {
-      case FFIType.i8:
-      case "i8":
-        return "int8_t";
-      case FFIType.u8:
-      case "u8":
-        return "uint8_t";
-      case FFIType.i16:
-      case "i16":
-        return "int16_t";
-      case FFIType.u16:
-      case "u16":
-        return "uint16_t";
-      case FFIType.i32:
-      case "i32":
-        return "int32_t";
-      case FFIType.u32:
-      case "u32":
-        return "uint32_t";
-      case FFIType.i64:
-      case "i64":
-        return "int64_t";
-      case FFIType.u64:
-      case "u64":
-        return "uint64_t";
-      case FFIType.f32:
-      case "f32":
-        return "float";
-      case FFIType.f64:
-      case "f64":
-        return "double";
-      case FFIType.bool:
-      case "bool":
-        return "bool";
-      case FFIType.pointer:
-      case "ptr":
-        return "void*";
-      case FFIType.cstring:
-      case "cstring":
-        return "char*";
-      case FFIType.void:
-      case "void":
-        return "void";
-      case FFIType.char:
-      case "char":
-        return "char";
-      case ClangType.CXString:
-        typedefs.add(CXStringTypedef);
-        return "CXString";
-      case ClangType.CXCursor:
-        typedefs.add(CXCursorTypedef);
-        return "CXCursor";
-      case ClangType.CXType:
-        typedefs.add(CXTypeTypedef);
-        return "CXType";
-      case ClangType.CXToken:
-        typedefs.add(CXTokenTypedef);
-        return "CXToken";
-      default:
-        throw new TypeError(`Unsupported type: ${type}`);
+    if (isByValueStruct(type)) {
+      typedefs.add(ClangTypedefs[type]);
+      return type;
+    } else {
+      switch (type) {
+        case FFIType.i8:
+        case "i8":
+          return "int8_t";
+        case FFIType.u8:
+        case "u8":
+          return "uint8_t";
+        case FFIType.i16:
+        case "i16":
+          return "int16_t";
+        case FFIType.u16:
+        case "u16":
+          return "uint16_t";
+        case FFIType.i32:
+        case "i32":
+          return "int32_t";
+        case FFIType.u32:
+        case "u32":
+          return "uint32_t";
+        case FFIType.i64:
+        case "i64":
+          return "int64_t";
+        case FFIType.u64:
+        case "u64":
+          return "uint64_t";
+        case FFIType.f32:
+        case "f32":
+          return "float";
+        case FFIType.f64:
+        case "f64":
+          return "double";
+        case FFIType.bool:
+        case "bool":
+          return "bool";
+        case FFIType.pointer:
+        case "ptr":
+          return "void*";
+        case FFIType.cstring:
+        case "cstring":
+          return "char*";
+        case FFIType.void:
+        case "void":
+          return "void";
+        case FFIType.char:
+        case "char":
+          return "char";
+        default:
+          throw new TypeError(`Unsupported type: ${type}`);
+      }
     }
   };
 
@@ -191,109 +221,51 @@ function genWrapperCode(name: string, func: ClangFFIFunctionLike): WrapperCode {
   const jsArgs: FFITypeOrString[] = [];
   let jsRet: FFITypeOrString;
 
-  switch (func.returns) {
-    case ClangType.CXString:
-      earlyRet = "NULL";
-      postCallForms.push(
-        CXStringToArrayBuffer("result", "result_buf", earlyRet),
-      );
-      retVar = "result_buf";
-      retType = "napi_value";
-      jsRet = FFIType.napi_value;
-      break;
-    case ClangType.CXCursor:
-      earlyRet = "NULL";
-      postCallForms.push(
-        CXCursorToArrayBuffer("result", "result_buf", earlyRet),
-      );
-      retVar = "result_buf";
-      retType = "napi_value";
-      jsRet = FFIType.napi_value;
-      break;
-    case ClangType.CXType:
-      earlyRet = "NULL";
-      postCallForms.push(CXTypeToArrayBuffer("result", "result_buf", earlyRet));
-      retVar = "result_buf";
-      retType = "napi_value";
-      jsRet = FFIType.napi_value;
-      break;
-    case ClangType.CXToken:
-      earlyRet = "NULL";
-      postCallForms.push(
-        CXTokenToArrayBuffer("result", "result_buf", earlyRet),
-      );
-      retVar = "result_buf";
-      retType = "napi_value";
-      jsRet = FFIType.napi_value;
-      break;
-    case FFIType.void:
-      earlyRet = "";
-      retVar = "";
-      retType = "void";
-      jsRet = FFIType.void;
-      break;
-    case FFIType.cstring:
-      earlyRet = "NULL";
-      postCallForms.push(cstringToJSString("result", "result_str", earlyRet));
-      retVar = "result_str";
-      retType = "napi_value";
-      jsRet = FFIType.napi_value;
-      break;
-    default:
-      earlyRet = "0";
-      retVar = "result";
-      retType = calleeRetType as FFITypeOrString;
-      jsRet = func.returns;
-      break;
+  if (isByValueStruct(func.returns)) {
+    earlyRet = "NULL";
+    postCallForms.push(
+      structToArrayBuffer(func.returns, "result", "result_buf", earlyRet),
+    );
+    retVar = "result_buf";
+    retType = "napi_value";
+    jsRet = FFIType.napi_value;
+  } else if (func.returns === FFIType.void) {
+    earlyRet = "";
+    retVar = "";
+    retType = "void";
+    jsRet = FFIType.void;
+  } else if (func.returns === FFIType.cstring) {
+    earlyRet = "NULL";
+    postCallForms.push(cstringToJSString("result", "result_str", earlyRet));
+    retVar = "result_str";
+    retType = "napi_value";
+    jsRet = FFIType.napi_value;
+  } else {
+    earlyRet = "0";
+    retVar = "result";
+    retType = calleeRetType as FFITypeOrString;
+    jsRet = func.returns as FFITypeOrString;
   }
   func.args.forEach((arg, i) => {
-    switch (arg) {
-      case ClangType.CXString:
-        defArgs.push(`napi_value arg${i}`);
-        preCallForms.push(
-          CXStringFromArrayBuffer(`arg${i}`, `arg${i}_buf`, earlyRet),
-        );
-        callArgs.push(`arg${i}_buf`);
-        jsArgs.push(FFIType.napi_value);
-        break;
-      case ClangType.CXCursor:
-        defArgs.push(`napi_value arg${i}`);
-        preCallForms.push(
-          CXCursorFromArrayBuffer(`arg${i}`, `arg${i}_buf`, earlyRet),
-        );
-        callArgs.push(`arg${i}_buf`);
-        jsArgs.push(FFIType.napi_value);
-        break;
-      case ClangType.CXType:
-        defArgs.push(`napi_value arg${i}`);
-        preCallForms.push(
-          CXTypeFromArrayBuffer(`arg${i}`, `arg${i}_buf`, earlyRet),
-        );
-        callArgs.push(`arg${i}_buf`);
-        jsArgs.push(FFIType.napi_value);
-        break;
-      case ClangType.CXToken:
-        defArgs.push(`napi_value arg${i}`);
-        preCallForms.push(
-          CXTokenFromArrayBuffer(`arg${i}`, `arg${i}_buf`, earlyRet),
-        );
-        callArgs.push(`arg${i}_buf`);
-        jsArgs.push(FFIType.napi_value);
-        break;
-      case FFIType.cstring:
-        defArgs.push(`napi_value arg${i}`);
-        preCallForms.push(
-          cstringFromJSString(`arg${i}`, `arg${i}_cstr`, earlyRet),
-        );
-        postCallForms.push(`free(arg${i}_cstr);`);
-        callArgs.push(`arg${i}_cstr`);
-        jsArgs.push(FFIType.napi_value);
-        break;
-      default:
-        defArgs.push(`${sig(arg)} arg${i}`);
-        callArgs.push(`arg${i}`);
-        jsArgs.push(arg);
-        break;
+    if (isByValueStruct(arg)) {
+      defArgs.push(`napi_value arg${i}`);
+      preCallForms.push(
+        structFromArrayBuffer(arg, `arg${i}`, `arg${i}_buf`, earlyRet),
+      );
+      callArgs.push(`arg${i}_buf`);
+      jsArgs.push(FFIType.napi_value);
+    } else if (arg === FFIType.cstring) {
+      defArgs.push(`napi_value arg${i}`);
+      preCallForms.push(
+        cstringFromJSString(`arg${i}`, `arg${i}_cstr`, earlyRet),
+      );
+      postCallForms.push(`free(arg${i}_cstr);`);
+      callArgs.push(`arg${i}_cstr`);
+      jsArgs.push(FFIType.napi_value);
+    } else {
+      defArgs.push(`${sig(arg)} arg${i}`);
+      callArgs.push(`arg${i}`);
+      jsArgs.push(arg as FFITypeOrString);
     }
   });
   defArgs.push("napi_env env");
@@ -329,9 +301,7 @@ export const defaultLibclangPath = (await Bun.file(
       : `libclang.${suffix}` // praise the DYLD_LIBRARY_PATH
     : `libclang.${suffix}`;
 
-export var libclang: Record<string, (...args: any[]) => any> | null = null;
-
-export function load(libclangPath?: string) {
+export function load(libclangPath: string = defaultLibclangPath) {
   // why we need the `library` option of `cc` to link libclang with TinyCC
   // when we can use symbols directly from RTLD_GLOBAL ? ¯\_(ツ)_/¯
   const libsystem = dlopen(
@@ -348,7 +318,7 @@ export function load(libclangPath?: string) {
   const RTLD_GLOBAL = 0x8;
 
   const libclangHandle = libsystem.dlopen(
-    Buffer.from(libclangPath ? libclangPath : defaultLibclangPath + "\0"),
+    Buffer.from(libclangPath + "\0"),
     RTLD_NOW | RTLD_GLOBAL,
   );
 
@@ -379,21 +349,20 @@ ${codes.join("\n")}
 `;
   const source = Bun.file(os.tmpdir() + `/__bun_libclang_wrapper.c`);
   Bun.write(source, code);
-  libclang = {};
+  const lib: Record<string, (...args: any[]) => any> = {};
   Object.entries(
     cc({
       source,
       symbols: fnss,
     }).symbols,
   ).forEach(([name, fn]) => {
-    libclang![name.replace("__wrapped_", "")] = fn;
+    lib[name.replace("__wrapped_", "")] = fn;
   });
   source.delete();
+  libclang = lib as libclangLib;
 }
 
-export function assertLibclang(
-  lib: any,
-): asserts lib is Record<string, (...args: any[]) => any> {
+export function assertLibclang(lib: any): asserts lib is libclangLib {
   if (!libclang) {
     throw new Error("libclang is not loaded. Call load() first.");
   }
@@ -404,5 +373,5 @@ export function assertLibclang(
 
 export function unload() {
   // again, nobody dlclose ;P
-  libclang = null;
+  libclang = undefined;
 }
